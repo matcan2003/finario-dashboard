@@ -57,7 +57,49 @@ function download(text,name,type){const a=document.createElement('a'),url=URL.cr
 $('quickBackup').addEventListener('click',exportJSON);$('exportJsonBtn').addEventListener('click',exportJSON);$('settingsBackupBtn').addEventListener('click',exportJSON);$('exportCsvBtn').addEventListener('click',()=>{const rows=[['Numero fattura','Data fattura','Data incasso','Importo','Cliente','Note'],...state.invoices.map(x=>[x.num,x.invoiceDate,x.date,x.amount,x.client,x.notes])];const csv='\ufeff'+rows.map(r=>r.map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(';')).join('\r\n');download(csv,'finario-fatture.csv','text/csv;charset=utf-8');notify('CSV esportato.')});
 function parseItalianMoney(raw){if(raw==null)return null;let s=String(raw).trim().replace(/\s/g,'').replace(/€/g,'');if(!s)return null;if(s.includes(',')&&s.includes('.'))s=s.replace(/\./g,'').replace(',','.');else if(s.includes(','))s=s.replace(',','.');const n=Number(s);return Number.isFinite(n)?n:null}
 function normalizeDate(raw){if(!raw)return '';let m=String(raw).match(/\b(\d{2})[\/.-](\d{2})[\/.-](\d{4})\b/);if(m)return `${m[3]}-${m[2]}-${m[1]}`;m=String(raw).match(/\b(\d{4})-(\d{2})-(\d{2})\b/);return m?m[0]:''}
-function extractInvoiceText(text){const lines=text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);const all=lines.join('\n');const find=(re)=>{const m=all.match(re);return m?(m[1]||m[0]).trim():''};let num=find(/(?:numero\s*(?:fattura|documento)?|n\.?\s*(?:fattura|doc\.?)|fattura\s*(?:numero|n\.?))[\s:#-]*([A-Z0-9][A-Z0-9\/_-]{0,24})/i);let dateRaw=find(/(?:data\s*(?:fattura|documento)?|data emissione)[\s:#-]*([0-3]?\d[\/.-][01]?\d[\/.-]\d{4}|\d{4}-\d{2}-\d{2})/i);let totalRaw=find(/(?:importo totale documento|totale documento|totale fattura|totale da pagare|totale complessivo|totale)[^\d\n]{0,24}(\d[\d. ]*(?:,\d{2})|\d+(?:\.\d{2})?)/i);if(!totalRaw){const candidates=[...all.matchAll(/(?:EUR|€)\s*([\d. ]+,\d{2}|\d+\.\d{2})/gi)];if(candidates.length)totalRaw=candidates[candidates.length-1][1]}let client='';const cl=find(/(?:cedente\s*prestatore|fornitore|intestatario|cliente)[\s:]+([^\n]{3,90})/i);if(cl)client=cl;else{const first=lines.find(l=>l.length>4&&!/fattura|documento|numero|data|partita iva|codice fiscale/i.test(l));if(first)client=first.slice(0,90)}return {num,invoiceDate:normalizeDate(dateRaw),amount:parseItalianMoney(totalRaw),client,hasText:all.length>40,rawPreview:all.slice(0,700)}}
+function extractInvoiceText(text){
+  // PDF.js può restituire i blocchi in ordine non lineare: conserviamo le righe
+  // e usiamo regole specifiche per i formati di fattura elettronica italiani.
+  const lines=String(text||'').split(/\r?\n/).map(s=>s.replace(/\s+/g,' ').trim()).filter(Boolean);
+  const all=lines.join('\n');
+  const flat=all.replace(/\s+/g,' ');
+  const firstMatch=(patterns,source=flat)=>{for(const re of patterns){const m=source.match(re);if(m)return (m[1]||m[0]).trim()}return ''};
+
+  // Numero: supporta, tra gli altri, "nr. FPR 1/26 del ..." e "Numero fattura: ...".
+  let num=firstMatch([
+    /\b(?:nr\.?|n\.?\s*r\.?|numero\s+(?:della\s+)?fattura|fattura\s+n(?:umero)?\.?)\s*[:#-]?\s*((?:FPR|TD\d{1,2})\s*\d+\s*\/\s*\d{2,4}|[A-Z0-9][A-Z0-9._/-]{0,24})\s*(?=\bdel\b|\bdata\b|\n|$)/i,
+    /\b(?:numero\s*(?:fattura|documento)?|fattura\s*(?:numero|n\.?))\s*[:#-]?\s*([A-Z0-9][A-Z0-9._/-]{0,24})/i
+  ],all).replace(/\s*\/\s*/g,'/').replace(/\s+/g,' ');
+
+  // La data nel formato italiano può seguire direttamente "del" dopo il numero.
+  let dateRaw=firstMatch([
+    /\b(?:nr\.?\s*[^\n]{0,35}?\s+del|fattura\s+[^\n]{0,35}?\s+del|data\s*(?:fattura|documento|emissione)?\s*[:#-]?)\s*([0-3]?\d[\/.\-][01]?\d[\/.\-]\d{4}|\d{4}-\d{2}-\d{2})/i,
+    /\bdata\s*(?:fattura|documento|emissione)\s*[:#-]?\s*([0-3]?\d[\/.\-][01]?\d[\/.\-]\d{4}|\d{4}-\d{2}-\d{2})/i
+  ],all);
+
+  // Preferisci il netto a pagare/totale documento, non le singole righe di servizio.
+  let totalRaw=firstMatch([
+    /\bnetto\s+a\s+pagare\b[^\d\n]{0,40}([\d. ]+,\d{2}|\d+\.\d{2})/i,
+    /\b(?:totale\s+documento|totale\s+fattura|totale\s+da\s+pagare|importo\s+totale\s+documento|totale\s+complessivo)\b[^\d\n]{0,40}([\d. ]+,\d{2}|\d+\.\d{2})/i
+  ],all);
+  if(!totalRaw){
+    const candidates=[...all.matchAll(/(?:EUR|€)\s*([\d. ]+,\d{2}|\d+\.\d{2})/gi)];
+    if(candidates.length)totalRaw=candidates[candidates.length-1][1];
+  }
+
+  // In fatture a due colonne, preferisci una ragione sociale (SRL/SPA/SAS/SNC)
+  // presente nel testo. Evita di confondere il fornitore con il cliente.
+  let client=firstMatch([
+    /\b([A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9 &'’.,-]{2,80}?\b(?:S\.?R\.?L\.?|S\.?P\.?A\.?|S\.?A\.?S\.?|S\.?N\.?C\.?))\b/,
+    /\bCLIENTE\s*[:\-]?\s*([^\n]{3,90})/i
+  ],all);
+  if(client)client=client.replace(/\s+(?:P\.?\s*IVA|C\.?\s*F\.?|codice destinatario).*$/i,'').trim();
+  if(!client){
+    const idx=lines.findIndex(l=>/\bCLIENTE\b/i.test(l));
+    if(idx>=0){for(const line of lines.slice(idx+1,idx+5)){if(line.length>3&&!/P\.?\s*IVA|C\.?\s*F\.?|codice destinatario/i.test(line)){client=line;break}}}
+  }
+  return {num,invoiceDate:normalizeDate(dateRaw),amount:parseItalianMoney(totalRaw),client,hasText:flat.length>40,rawPreview:flat.slice(0,900)}
+}
 async function readPdf(file){if(!window.pdfjsLib)throw new Error('La libreria PDF.js non è stata caricata. Controlla la connessione Internet e riapri il file.');window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';const pdf=await window.pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;let text='';for(let n=1;n<=pdf.numPages;n++){const page=await pdf.getPage(n);const content=await page.getTextContent();let lastY=null,line='';for(const item of content.items){if(!item.str)continue;const y=Math.round(item.transform?.[5]||0);if(lastY!==null&&Math.abs(y-lastY)>3){text+=line+'\n';line=''}line+=item.str+' ';lastY=y}text+=line+'\n'}return extractInvoiceText(text)}
 $('analyzePdfBtn').addEventListener('click',async()=>{const file=$('pdfFile').files[0];if(!file){$('pdfStatus').textContent='Prima seleziona un file PDF.';return}if(!/\.pdf$/i.test(file.name)&&file.type!=='application/pdf'){$('pdfStatus').textContent='Il file selezionato non sembra un PDF.';return}$('analyzePdfBtn').disabled=true;$('pdfStatus').textContent='Lettura PDF in corso…';try{const d=await readPdf(file);if(!d.hasText)throw new Error('Non è stato trovato testo leggibile: potrebbe essere una scansione. Questa versione non include OCR.');if(d.num)$('invoiceNum').value=d.num;if(d.invoiceDate)$('invoiceDate').value=d.invoiceDate;if(d.amount!==null&&d.amount>0)$('invoiceAmount').value=d.amount.toFixed(2);if(d.client)$('invoiceClient').value=d.client;if(!$('paymentDate').value)$('paymentDate').value=isoToday();const missing=[];if(!d.num)missing.push('numero');if(!d.invoiceDate)missing.push('data fattura');if(!(d.amount>0))missing.push('importo');$('pdfStatus').textContent=`PDF letto (${file.name}). Campi riconosciuti: ${[d.num?'numero':'',d.invoiceDate?'data fattura':'',d.amount>0?'importo':'',d.client?'intestatario/descrizione':''].filter(Boolean).join(', ')||'nessuno con certezza'}. ${missing.length?'Da compilare/verificare: '+missing.join(', ')+'. ':''}La data d’incasso va inserita manualmente. Controlla tutto prima di salvare.`;notify('Lettura completata: controlla i campi prima di salvare.')}catch(e){$('pdfStatus').textContent='Non sono riuscita a leggere il PDF: '+e.message;notify('Lettura PDF non riuscita.')}finally{$('analyzePdfBtn').disabled=false}});$('clearPdfBtn').addEventListener('click',()=>{$('pdfFile').value='';$('pdfStatus').textContent='Nessun PDF selezionato.'});
 async function importJSONFile(file,mode){const d=JSON.parse(await file.text());const list=Array.isArray(d)?d:d.invoices;if(!Array.isArray(list))throw new Error('Il JSON non contiene un elenco fatture riconoscibile.');const cleaned=list.map(cleanInvoice).filter(x=>x.amount>0);if(mode==='replace')state.invoices=cleaned;else{const existing=new Set(state.invoices.map(x=>x.id));state.invoices.push(...cleaned.map(x=>existing.has(x.id)?{...x,id:makeId()}:x))}const s=d.settings||d.p||d.prefs;if(s)state.settings={...state.settings,rate:Number(s.rate??state.settings.rate),coef:Number(s.coef??state.settings.coef),inps:Number(s.inps??s.inpsRate??state.settings.inps),cash:Number(s.cash??state.settings.cash),reserve:Number(s.reserve??state.settings.reserve)};saveState();renderAll()}
